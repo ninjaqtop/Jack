@@ -42,17 +42,16 @@ jobs:
       - name: Write local.properties
         run: echo "sdk.dir=$ANDROID_HOME" > local.properties
 
-      - name: Verify Gradle configuration
-        run: ./gradlew help --no-daemon 2>&1 | tail -20
-        env:
-          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx2g -Dorg.gradle.daemon=false"
-
       - name: Build Debug APK
         run: |
           set -o pipefail
           ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
         env:
           GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m -Dorg.gradle.daemon=false -Dkotlin.incremental=false"
+
+      - name: Show build errors
+        if: failure()
+        run: cat build.log || echo "No build.log found"
 
       - name: Upload build log on failure
         if: failure()
