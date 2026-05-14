@@ -15,6 +15,7 @@ import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
 import com.aggregatorx.app.engine.network.ProxyVPNEngine
 import com.aggregatorx.app.engine.network.CloudflareBypassEngine
 import com.aggregatorx.app.engine.scraper.SmartNavigationEngine
+import com.aggregatorx.app.engine.search.TwoPhaseSearchEngine
 import com.aggregatorx.app.engine.token.TokenManager
 import com.aggregatorx.app.engine.vision.VisionEngine
 import dagger.Module
@@ -124,6 +125,12 @@ object EngineModule {
     @Provides
     @Singleton
     fun provideVisionEngine(httpClient: OkHttpClient): VisionEngine = VisionEngine(httpClient)
+
+    @Provides
+    @Singleton
+    fun provideTwoPhaseSearchEngine(): TwoPhaseSearchEngine {
+        return TwoPhaseSearchEngine()
+    }
 
     @Provides
     @Singleton
