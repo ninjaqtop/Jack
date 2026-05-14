@@ -28,6 +28,7 @@ class AggregatorRepository @Inject constructor(
     fun clearSearchCache() {
         scrapingEngine.clearCache()
     }
+    
     // Providers
     fun getAllProviders(): Flow<List<Provider>> = providerDao.getAllProviders()
     fun getEnabledProviders(): Flow<List<Provider>> = providerDao.getEnabledProviders()
@@ -109,12 +110,31 @@ class AggregatorRepository @Inject constructor(
         return siteAnalysisDao.getLatestAnalysis(providerId)
     }
     
-    // BUILD FIX: Added `pages` parameter to match ViewModel call.
-    fun searchAllProviders(query: String, pages: Map<String, Int> = emptyMap()): Flow<ProviderSearchResults> {
-        // Always pass false for cache to ensure fresh results for each unique query
-        // The cache is cleared before each search anyway, so this ensures no stale results
-        // Note: If ScrapingEngine supports pagination in the future, pass 'pages' to it.
-        return scrapingEngine.searchAllProviders(query, false)
+    /**
+     * Search all enabled providers with TWO-PHASE approach
+     * 
+     * IMPORTANT: Cache is disabled by default (cache = false)
+     * This ensures fresh searches every time for query-tailored results
+     * 
+     * Phase 1: Direct Query Search
+     *   - Each provider performs fresh search
+     *   - No caching between searches
+     *   - High confidence results (0.95f)
+     * 
+     * Phase 2: Preference-Based Ranking
+     *   - Results re-ranked by user preferences
+     *   - Boosts quality, ratings, user likes
+     *   - Medium-high confidence (0.70-0.90f)
+     */
+    fun searchAllProviders(
+        query: String,
+        pages: Map<String, Int> = emptyMap(),
+        cache: Boolean = false  // CHANGED: Disabled by default for fresh results
+    ): Flow<ProviderSearchResults> {
+        // Always use cache = false to ensure fresh searches
+        // ScrapingEngine will perform actual queries on each provider site
+        // No stale cached results will be returned
+        return scrapingEngine.searchAllProviders(query, cache)
     }
     
     suspend fun aggregateSearchResults(
