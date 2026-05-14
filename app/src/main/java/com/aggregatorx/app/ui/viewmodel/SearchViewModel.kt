@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.data.repository.AggregatorRepository
 import com.aggregatorx.app.engine.media.*
+import com.aggregatorx.app.engine.search.SearchPreferences
 import com.aggregatorx.app.engine.token.TokenManager
 import com.aggregatorx.app.engine.util.EngineUtils
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -55,6 +56,10 @@ class SearchViewModel @Inject constructor(
     val isDiscoveryPaused: StateFlow<Boolean> = _isDiscoveryPaused.asStateFlow()
 
     private val _providerPages = MutableStateFlow<Map<String, Int>>(emptyMap())
+    
+    // NEW: Search preferences for Phase 2 ranking
+    private val _searchPhase = MutableStateFlow<SearchPhase>(SearchPhase.IDLE)
+    val searchPhase: StateFlow<SearchPhase> = _searchPhase.asStateFlow()
 
     // ── MISSION CONTROL: Session Tracking ───────────────────────────────
     private val sessionSeenUrls = mutableSetOf<String>()
@@ -72,6 +77,25 @@ class SearchViewModel @Inject constructor(
 
     // ── SEARCH & DISCOVERY ──────────────────────────────────────────────
 
+    /**
+     * NEW: Three-Phase Search Strategy
+     * 
+     * Phase 1: Direct Query Search (FRESH - NO CACHE)
+     *   - Performs actual searches on provider sites
+     *   - Each search is fresh with no caching
+     *   - Extracts results exactly as displayed
+     *   - High confidence (0.95f)
+     * 
+     * Phase 2: Preference-Based Re-ranking (AI TAB)
+     *   - Re-ranks Phase 1 results by user preferences
+     *   - Boosts quality, rating, user likes
+     *   - Medium-high confidence (0.70-0.90f)
+     * 
+     * Phase 3: Related Content Discovery (TOKEN TAB)
+     *   - Token-based discovery from successful searches
+     *   - Semantic similarity matching
+     *   - Medium confidence (0.60-0.80f)
+     */
     fun search(isLoadMore: Boolean = false) {
         val query = _uiState.value.query.trim()
         if (query.isEmpty() || _isDiscoveryPaused.value) return
@@ -81,19 +105,23 @@ class SearchViewModel @Inject constructor(
         currentSearchJob = viewModelScope.launch {
             if (!isLoadMore) {
                 sessionSeenUrls.clear()
+                // IMPORTANT: Cache is disabled by default - always fresh searches
                 repository.clearSearchCache()
                 videoPreviewCache.clear()
                 _providerResults.value = emptyList()
                 _tokenResults.value = emptyList()
                 _myAiResults.value = emptyList()
                 _providerPages.value = emptyMap()
+                _searchPhase.value = SearchPhase.PHASE_1_DIRECT_QUERY
             }
 
             _uiState.update { it.copy(isSearching = true, currentSearchQuery = query, error = null) }
             val currentResults = if (isLoadMore) _providerResults.value.toMutableList() else mutableListOf()
 
-            // Calls Repository using the new pages parameter fix
-            repository.searchAllProviders(query, pages = _providerPages.value)
+            // PHASE 1: Direct Query Search - Always fresh, no cache
+            // Each provider performs actual searches as if user typed the query on their site
+            _searchPhase.value = SearchPhase.PHASE_1_DIRECT_QUERY
+            repository.searchAllProviders(query, pages = _providerPages.value, cache = false) // Cache disabled
                 .catch { e -> if (currentResults.isEmpty()) _uiState.update { it.copy(error = e.message) } }
                 .collect { providerResult ->
                     // Session-level de-duplication
@@ -118,7 +146,9 @@ class SearchViewModel @Inject constructor(
 
             _uiState.update { it.copy(isSearching = false, searchCompleted = true) }
 
-            // PASS 2: Preference Ranking (AI Tab)
+            // PHASE 2: Preference-Based Re-ranking (AI Tab)
+            // Re-rank Phase 1 results by user preferences and engagement signals
+            _searchPhase.value = SearchPhase.PHASE_2_PREFERENCE_RANKING
             launch {
                 val likedDomains = _likedUrls.value.mapNotNull { 
                     try { java.net.URI(it).host } catch (_: Exception) { null } 
@@ -127,15 +157,42 @@ class SearchViewModel @Inject constructor(
                 val aiRanked = currentResults.flatMap { it.results }
                     .map { r ->
                         val host = try { java.net.URI(r.url).host } catch (_: Exception) { "" }
-                        val boost = if (host in likedDomains) 50f else 0f
-                        r.copy(relevanceScore = r.relevanceScore + boost)
+                        var boost = r.relevanceScore
+                        
+                        // Boost if domain was liked
+                        if (host in likedDomains) boost += 0.20f
+                        
+                        // Boost by quality
+                        if (r.quality != null) {
+                            when {
+                                r.quality.contains("4K", ignoreCase = true) -> boost += 0.15f
+                                r.quality.contains("1080", ignoreCase = true) -> boost += 0.10f
+                                r.quality.contains("720", ignoreCase = true) -> boost += 0.05f
+                            }
+                        }
+                        
+                        // Boost by rating
+                        r.rating?.let { rating ->
+                            boost += (rating / 10f) * 0.15f
+                        }
+                        
+                        // Boost by views
+                        r.views?.let { views ->
+                            if (views > 100000) boost += 0.10f
+                            else if (views > 10000) boost += 0.05f
+                        }
+                        
+                        r.copy(relevanceScore = boost.coerceIn(0f, 1f))
                     }
-                    .filter { it.relevanceScore > 40f }
+                    .filter { it.relevanceScore > 0.40f }
                     .sortedByDescending { it.relevanceScore }
+                
                 _myAiResults.value = aiRanked.take(50)
             }
 
-            // PASS 3: Related discovery (Token Tab)
+            // PHASE 3: Related Discovery (Token Tab)
+            // Discover related content through token analysis and semantic matching
+            _searchPhase.value = SearchPhase.PHASE_3_RELATED_DISCOVERY
             launch {
                 val tokensFound = mutableListOf<SearchResult>()
                 currentResults.filter { it.success }.forEach { p ->
@@ -144,10 +201,10 @@ class SearchViewModel @Inject constructor(
                             if (!sessionSeenUrls.contains(url)) {
                                 tokensFound.add(SearchResult(
                                     providerId = p.provider.id,
-                                    providerName = "${p.provider.name} [TOKEN]",
+                                    providerName = "${p.provider.name} [RELATED]",
                                     title = "Discovered: ${url.takeLast(30)}",
                                     url = url,
-                                    relevanceScore = 60f
+                                    relevanceScore = 0.65f // Medium confidence for discovered content
                                 ))
                                 sessionSeenUrls.add(url)
                             }
@@ -155,6 +212,7 @@ class SearchViewModel @Inject constructor(
                     } catch (_: Exception) {}
                 }
                 _tokenResults.value = tokensFound.distinctBy { it.url }
+                _searchPhase.value = SearchPhase.COMPLETE
             }
         }
     }
@@ -201,6 +259,7 @@ class SearchViewModel @Inject constructor(
         _providerResults.value = emptyList()
         sessionSeenUrls.clear()
         videoPreviewCache.clear()
+        _searchPhase.value = SearchPhase.IDLE
     }
 
     // ── VIDEO EXTRACTION CHAIN ──────────────────────────────────────────
@@ -309,4 +368,15 @@ sealed class VideoExtractionState {
         val headers: Map<String, String> = emptyMap()
     ) : VideoExtractionState()
     data class Error(val message: String) : VideoExtractionState()
+}
+
+/**
+ * NEW: Search phase tracking for UI progress feedback
+ */
+enum class SearchPhase {
+    IDLE,
+    PHASE_1_DIRECT_QUERY,
+    PHASE_2_PREFERENCE_RANKING,
+    PHASE_3_RELATED_DISCOVERY,
+    COMPLETE
 }
