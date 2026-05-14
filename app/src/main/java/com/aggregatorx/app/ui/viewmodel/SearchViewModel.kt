@@ -5,7 +5,6 @@ import androidx.lifecycle.viewModelScope
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.data.repository.AggregatorRepository
 import com.aggregatorx.app.engine.media.*
-import com.aggregatorx.app.engine.search.SearchPreferences
 import com.aggregatorx.app.engine.token.TokenManager
 import com.aggregatorx.app.engine.util.EngineUtils
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -56,8 +55,9 @@ class SearchViewModel @Inject constructor(
     val isDiscoveryPaused: StateFlow<Boolean> = _isDiscoveryPaused.asStateFlow()
 
     private val _providerPages = MutableStateFlow<Map<String, Int>>(emptyMap())
-    
-    // NEW: Search preferences for Phase 2 ranking
+    val providerPages: StateFlow<Map<String, Int>> = _providerPages.asStateFlow()
+
+    // Search preferences for Phase 2 ranking
     private val _searchPhase = MutableStateFlow<SearchPhase>(SearchPhase.IDLE)
     val searchPhase: StateFlow<SearchPhase> = _searchPhase.asStateFlow()
 
@@ -121,7 +121,7 @@ class SearchViewModel @Inject constructor(
             // PHASE 1: Direct Query Search - Always fresh, no cache
             // Each provider performs actual searches as if user typed the query on their site
             _searchPhase.value = SearchPhase.PHASE_1_DIRECT_QUERY
-            repository.searchAllProviders(query, pages = _providerPages.value, cache = false) // Cache disabled
+            repository.searchAllProviders(query, pages = _providerPages.value)
                 .catch { e -> if (currentResults.isEmpty()) _uiState.update { it.copy(error = e.message) } }
                 .collect { providerResult ->
                     // Session-level de-duplication
@@ -225,6 +225,28 @@ class SearchViewModel @Inject constructor(
             pages + (providerId to current + 1)
         }
         search(isLoadMore = true)
+    }
+
+    fun prevProviderPage(providerId: String) {
+        _providerPages.update { pages ->
+            val current = pages[providerId] ?: 0
+            if (current > 0) pages + (providerId to current - 1) else pages
+        }
+        search(isLoadMore = false)
+    }
+
+    fun refreshProvider(providerId: String) {
+        _providerPages.update { pages -> pages - providerId }
+        search(isLoadMore = false)
+    }
+
+    fun searchFromHistory(query: String) {
+        _uiState.update { it.copy(query = query) }
+        search(isLoadMore = false)
+    }
+
+    fun clearSearchHistory() {
+        viewModelScope.launch { repository.clearSearchHistory() }
     }
 
     fun panicRefresh() {
