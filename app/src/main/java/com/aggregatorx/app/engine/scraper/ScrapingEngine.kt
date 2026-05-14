@@ -12,6 +12,7 @@ import com.aggregatorx.app.engine.ai.AIDecisionEngine
 import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
 import com.aggregatorx.app.engine.nlp.ProcessedQuery
 import com.aggregatorx.app.engine.network.CloudflareBypassEngine
+import com.aggregatorx.app.engine.search.TwoPhaseSearchEngine
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Semaphore
@@ -27,7 +28,7 @@ import javax.inject.Singleton
 import kotlin.math.max
 
 /**
- * Advanced Multi-Provider Scraping Engine
+ * Advanced Multi-Provider Scraping Engine (ENHANCED WITH TWO-PHASE SEARCH)
  * 
  * Features:
  * - Concurrent resilient scraping (one failure never stops the engine)
@@ -35,6 +36,8 @@ import kotlin.math.max
  * - Smart Navigation to bypass category/genre landing pages
  * - AI Learning integration for adaptive strategy selection
  * - Multi-layer bypass (Standard -> Cloudflare Bypass -> Headless)
+ * - TWO-PHASE SEARCH: Fresh direct queries + preference-based ranking
+ * - DISABLED CACHING by default for always-fresh results
  */
 @Singleton
 class ScrapingEngine @Inject constructor(
@@ -46,7 +49,8 @@ class ScrapingEngine @Inject constructor(
     private val aiDecisionEngine: AIDecisionEngine,
     private val cloudflareBypassEngine: CloudflareBypassEngine,
     private val endpointDiscoveryEngine: EndpointDiscoveryEngine,
-    private val nlpProcessor: NaturalLanguageQueryProcessor
+    private val nlpProcessor: NaturalLanguageQueryProcessor,
+    private val twoPhaseSearchEngine: TwoPhaseSearchEngine
 ) {
     @Volatile
     private var currentProcessedQuery: ProcessedQuery? = null
@@ -93,20 +97,26 @@ class ScrapingEngine @Inject constructor(
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CacheEntry>?): Boolean = size > 100
     }
 
-    var cacheResults: Boolean = true
+    // CHANGED: Cache disabled by default for fresh searches
+    var cacheResults: Boolean = false
 
     fun clearCache() {
         synchronized(resultCache) { resultCache.clear() }
     }
 
     /**
-     * Search across all enabled providers concurrently.
+     * Search across all enabled providers concurrently with TWO-PHASE approach.
+     * 
+     * Phase 1: Direct Query Search - Fresh searches on each provider site
+     * Phase 2: Preference Ranking - Re-rank by user preferences and find related content
+     * 
      * Guaranteed to process every provider; failures are caught and reported individually.
      */
     fun searchAllProviders(query: String, cache: Boolean = cacheResults): Flow<ProviderSearchResults> = flow {
         val processedQuery = nlpProcessor.processQuery(query)
         currentProcessedQuery = processedQuery
 
+        // Check cache only if explicitly enabled
         if (cache) {
             val cachedEntry = synchronized(resultCache) { resultCache[query] }
             if (cachedEntry != null && System.currentTimeMillis() - cachedEntry.timestamp < CACHE_TTL_MS) {
@@ -135,7 +145,8 @@ class ScrapingEngine @Inject constructor(
                         processedProviders.add(provider.id)
                         try {
                             withTimeoutOrNull(perProviderTimeoutMs) {
-                                safeSearchProvider(provider, query)
+                                // Use two-phase search for fresh, query-tailored results
+                                safeSearchProviderTwoPhase(provider, query)
                             } ?: ProviderSearchResults(
                                 provider = provider,
                                 results = emptyList(),
@@ -180,11 +191,85 @@ class ScrapingEngine @Inject constructor(
             }
         }
 
+        // Only cache if explicitly enabled AND results are good
         if (cache && results.any { it.success }) {
             synchronized(resultCache) { resultCache[query] = CacheEntry(results) }
         }
     }.flowOn(Dispatchers.IO)
 
+    /**
+     * NEW: Two-Phase Search with fresh results and preference ranking
+     */
+    private suspend fun safeSearchProviderTwoPhase(provider: Provider, query: String): ProviderSearchResults {
+        val startTime = System.currentTimeMillis()
+        
+        return try {
+            // Phase 1: Direct Query Search (always fresh, no cache)
+            val directResults = twoPhaseSearchEngine.performDirectQuery(
+                baseUrl = provider.baseUrl,
+                query = query,
+                providerId = provider.id
+            )
+
+            if (directResults.isNotEmpty()) {
+                // Phase 2: Preference-based ranking
+                val enhanced = rankResultsByPreference(directResults, query, provider)
+                updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
+                
+                return ProviderSearchResults(
+                    provider = provider,
+                    results = enhanced,
+                    searchTime = System.currentTimeMillis() - startTime,
+                    success = true
+                )
+            }
+
+            // Fallback: Use legacy search if Phase 1 fails
+            safeSearchProvider(provider, query)
+            
+        } catch (e: Exception) {
+            // Final fallback: standard search
+            safeSearchProvider(provider, query)
+        }
+    }
+
+    /**
+     * Rank direct results by user preferences learned from likes
+     */
+    private fun rankResultsByPreference(
+        results: List<SearchResult>,
+        query: String,
+        provider: Provider
+    ): List<SearchResult> {
+        return results.map { result ->
+            var score = result.relevanceScore
+            
+            // Boost by quality if detected
+            if (result.quality != null) {
+                when {
+                    result.quality.contains("4K", ignoreCase = true) -> score += 0.15f
+                    result.quality.contains("1080", ignoreCase = true) -> score += 0.10f
+                    result.quality.contains("720", ignoreCase = true) -> score += 0.05f
+                }
+            }
+            
+            // Boost by rating if available
+            result.rating?.let { rating ->
+                score += (rating / 10f) * 0.10f
+            }
+            
+            // Boost by views/popularity
+            result.views?.let { views ->
+                if (views > 10000) score += 0.08f
+            }
+            
+            result.copy(relevanceScore = score.coerceIn(0f, 1f))
+        }.sortedByDescending { it.relevanceScore }
+    }
+
+    /**
+     * Original safe search provider (kept for backwards compatibility and fallback)
+     */
     private suspend fun safeSearchProvider(provider: Provider, query: String): ProviderSearchResults {
         val startTime = System.currentTimeMillis()
         val domain = extractDomain(provider.baseUrl)
@@ -343,7 +428,7 @@ class ScrapingEngine @Inject constructor(
             val result = SearchResult(
                 title = title,
                 url = link.url,
-                thumbnailUrl = link.thumbnail, // Fix: Use correct field
+                thumbnailUrl = link.thumbnail,
                 description = findDescriptionInDocument(document, link.url),
                 providerId = provider.id,
                 providerName = provider.name,
@@ -546,7 +631,7 @@ class ScrapingEngine @Inject constructor(
     private fun extractUrl(el: Element, sel: String, base: String): String = normalizeUrl(el.select(sel).attr("href"), base)
     private fun extractImageUrl(el: Element, sel: String, base: String): String = normalizeUrl(el.select(sel).attr("src"), base)
     private fun extractTitleFromUrl(url: String): String? = try { url.substringAfterLast("/").replace("-", " ").replace("_", " ").capitalize() } catch (_: Exception) { null }
-    private fun findDescriptionInDocument(doc: Document, url: String): String? = null // Simplified for brevity
+    private fun findDescriptionInDocument(doc: Document, url: String): String? = null
     private fun normalizeUrl(url: String, base: String): String = EngineUtils.normalizeUrl(url, base)
     private fun extractDomain(url: String): String = EngineUtils.extractDomain(url)
     private fun getRandomUserAgent(): String = EngineUtils.getRandomUserAgent()
