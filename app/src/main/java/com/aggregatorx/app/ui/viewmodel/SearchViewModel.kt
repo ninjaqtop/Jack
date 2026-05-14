@@ -275,7 +275,9 @@ class SearchViewModel @Inject constructor(
     }
 
     fun updateQuery(query: String) { _uiState.update { it.copy(query = query) } }
-    
+
+    fun clearError() { _uiState.update { it.copy(error = null) } }
+
     fun clearSearch() {
         _uiState.update { it.copy(query = "", aggregatedResults = null, searchCompleted = false, error = null) }
         _providerResults.value = emptyList()
