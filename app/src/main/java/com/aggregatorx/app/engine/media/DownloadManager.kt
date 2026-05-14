@@ -42,9 +42,10 @@ import javax.inject.Singleton
 @Singleton
 class DownloadManager @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val videoExtractor: VideoExtractorEngine,
-    var downloadDirectory: String? = null
+    private val videoExtractor: VideoExtractorEngine
 ) {
+    // Set externally via SettingsViewModel; not injected to avoid ambiguous String binding
+    var downloadDirectory: String? = null
     
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(60, TimeUnit.SECONDS)
