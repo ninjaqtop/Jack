@@ -47,6 +47,14 @@ jobs:
         env:
           GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m -Dorg.gradle.daemon=false -Dkotlin.incremental=false"
 
+      - name: Print build errors on failure
+        if: failure()
+        run: |
+          echo "## Build Failure Log" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E "error:|Error:|FAILED|Exception|Caused by:|> Task|e:" build.log | tail -60 >> "$GITHUB_STEP_SUMMARY" || tail -80 build.log >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload build log on failure
         if: failure()
         uses: actions/upload-artifact@v4
